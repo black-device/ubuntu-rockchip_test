@@ -1,3 +1,33 @@
+u-boot-radxa-rk3588 (2017.09+20240128.git722a6ab0-6) jammy; urgency=medium
+
+  * Refactor armsom pd patch
+
+ -- Joshua Riek <jjriek@verizon.net>  Sat, 27 Apr 2024 12:26:15 -0400
+
+u-boot-radxa-rk3588 (2017.09+20240128.git722a6ab0-5) jammy; urgency=medium
+
+  * move config preboot into the armsom defconfig
+
+ -- Joshua Riek <jjriek@verizon.net>  Tue, 26 Mar 2024 19:39:13 -0400
+
+u-boot-radxa-rk3588 (2017.09+20240128.git722a6ab0-4) jammy; urgency=medium
+
+  * Add PD negotiation for the armsom sige 7
+
+ -- Joshua Riek <jjriek@verizon.net>  Tue, 26 Mar 2024 19:24:39 -0400
+
+u-boot-radxa-rk3588 (2017.09+20240128.git722a6ab0-3) jammy; urgency=medium
+
+  * Use flashcp to update spi flash
+
+ -- Joshua Riek <jjriek@verizon.net>  Mon, 25 Mar 2024 14:07:42 -0400
+
+u-boot-radxa-rk3588 (2017.09+20240128.git722a6ab0-2) jammy; urgency=medium
+
+  * Fix gcc 13 compile error
+
+ -- Joshua Riek <jjriek@verizon.net>  Sun, 11 Feb 2024 20:51:36 -0500
+
 u-boot-radxa-rk3588 (2017.09+20240128.git722a6ab0-1) jammy; urgency=medium
 
   * arm: dts: add radxa e25 support

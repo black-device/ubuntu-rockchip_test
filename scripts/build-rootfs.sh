@@ -11,16 +11,44 @@ fi
 cd "$(dirname -- "$(readlink -f -- "$0")")" && cd ..
 mkdir -p build && cd build
 
+if [[ -z ${RELEASE} ]]; then
+    echo "Error: RELEASE is not set"
+    exit 1
+fi
+
+# shellcheck source=/dev/null
+source ../config/releases/"${RELEASE}.sh"
+
 if [[ ${DESKTOP_ONLY} == "Y" ]]; then
-    if [[ -f ubuntu-22.04.3-preinstalled-desktop-arm64.rootfs.tar.xz ]]; then
+    if [[ -f ubuntu-${RELASE_VERSION}-preinstalled-desktop-arm64.rootfs.tar.xz ]]; then
         exit 0
     fi
 elif [[ ${SERVER_ONLY} == "Y" ]]; then
-    if [[ -f ubuntu-22.04.3-preinstalled-server-arm64.rootfs.tar.xz ]]; then
+    if [[ -f ubuntu-${RELASE_VERSION}-preinstalled-server-arm64.rootfs.tar.xz ]]; then
         exit 0
     fi
 else
-    if [[ -f ubuntu-22.04.3-preinstalled-server-arm64.rootfs.tar.xz && -f ubuntu-22.04.3-preinstalled-desktop-arm64.rootfs.tar.xz ]]; then
+    if [[ -f ubuntu-${RELASE_VERSION}-preinstalled-server-arm64.rootfs.tar.xz && -f ubuntu-${RELASE_VERSION}-preinstalled-desktop-arm64.rootfs.tar.xz ]]; then
+        exit 0
+    fi
+fi
+
+if [[ ${SERVER_ONLY} == "Y" ]]; then
+    if [[ ${RELEASE} == "noble" ]]; then
+        git clone https://github.com/Joshua-Riek/ubuntu-live-build.git
+        cd ubuntu-live-build
+        sudo ./livecd-rootfs.sh && sudo ./build.sh -s
+        mv "./build/ubuntu-${RELASE_VERSION}-preinstalled-server-arm64.rootfs.tar.xz" ../
+        exit 0
+    fi
+fi
+
+if [[ ${DESKTOP_ONLY} == "Y" ]]; then
+    if [[ ${RELEASE} == "noble" ]]; then
+        git clone https://github.com/Joshua-Riek/ubuntu-live-build.git
+        cd ubuntu-live-build
+        sudo ./livecd-rootfs.sh && sudo ./build.sh -d
+        mv "./build/ubuntu-${RELASE_VERSION}-preinstalled-desktop-arm64.rootfs.tar.xz" ../
         exit 0
     fi
 fi
@@ -35,7 +63,7 @@ export DEBIAN_FRONTEND=noninteractive
 
 # Debootstrap options
 arch=arm64
-release=jammy
+release=${RELEASE}
 mirror=http://ports.ubuntu.com/ubuntu-ports
 chroot_dir=rootfs
 overlay_dir=../overlay
@@ -103,7 +131,23 @@ mount -o bind /dev ${chroot_dir}/dev
 mount -o bind /dev/pts ${chroot_dir}/dev/pts
 
 # Package priority for ppa
-cp ${overlay_dir}/etc/apt/preferences.d/rockchip-ppa ${chroot_dir}/etc/apt/preferences.d/rockchip-ppa
+if [[ ${RELEASE} == "jammy" ]]; then
+    cat > ${chroot_dir}/etc/apt/preferences.d/rockchip-ppa << EOF
+Package: *
+Pin: release o=LP-PPA-jjriek-rockchip
+Pin-Priority: 1001
+
+Package: flash-kernel
+Pin: release o=LP-PPA-jjriek-rockchip
+Pin-Priority: 1
+EOF
+else
+    cat > ${chroot_dir}/etc/apt/preferences.d/rockchip-ppa << EOF
+Package: *
+Pin: release o=LP-PPA-jjriek-rockchip
+Pin-Priority: 1001
+EOF
+fi
 
 # Download and update packages
 cat << EOF | chroot ${chroot_dir} /bin/bash
@@ -129,22 +173,14 @@ p7zip-full htop iotop pciutils lshw lsof landscape-common exfat-fuse hwinfo \
 net-tools wireless-tools openssh-client openssh-server wpasupplicant ifupdown \
 pigz wget curl lm-sensors bluez gdisk usb-modeswitch usb-modeswitch-data make \
 gcc libc6-dev bison libssl-dev flex fake-hwclock wireless-regdb psmisc rsync \
-uuid-runtime linux-firmware rockchip-firmware cloud-initramfs-growroot flash-kernel
+uuid-runtime linux-firmware rockchip-firmware cloud-initramfs-growroot flash-kernel \
+avahi-daemon
 
 # Remove cryptsetup and needrestart
-apt-get -y remove cryptsetup needrestart
+apt-get -y remove cryptsetup needrestart snapd fwupd
 
 # Clean package cache
 apt-get -y autoremove && apt-get -y clean && apt-get -y autoclean
-EOF
-
-# Add flash kernel override
-cat << EOF >> ${chroot_dir}/etc/flash-kernel/db
-Machine: *
-Kernel-Flavors: any
-Method: pi
-Boot-Kernel-Path: /boot/firmware/vmlinuz
-Boot-Initrd-Path: /boot/firmware/initrd.img
 EOF
 
 # DNS
@@ -162,11 +198,9 @@ cp ${overlay_dir}/etc/profile.d/resize.sh ${chroot_dir}/etc/profile.d/resize.sh
 # Enable rc-local
 cp ${overlay_dir}/etc/rc.local ${chroot_dir}/etc/rc.local
 
-# Cloud init config
-cp ${overlay_dir}/etc/cloud/cloud.cfg.d/99-fake_cloud.cfg ${chroot_dir}/etc/cloud/cloud.cfg.d/99-fake_cloud.cfg
-
-# Default adduser config
-cp ${overlay_dir}/etc/adduser.conf ${chroot_dir}/etc/adduser.conf
+# Add extra groups to adduser config
+sed -i 's/#EXTRA_GROUPS=.*/EXTRA_GROUPS="video adm dialout cdrom audio plugdev netdev input bluetooth floppy users"/g' ${chroot_dir}/etc/adduser.conf
+sed -i 's/#ADD_EXTRA_GROUPS=.*/ADD_EXTRA_GROUPS=1/g' ${chroot_dir}/etc/adduser.conf
 
 # Service to synchronise system clock to hardware RTC
 cp ${overlay_dir}/usr/lib/systemd/system/rtc-hym8563.service ${chroot_dir}/usr/lib/systemd/system/rtc-hym8563.service
@@ -187,7 +221,8 @@ mkdir -p ${chroot_dir}/etc/systemd/system/systemd-networkd-wait-online.service.d
 cp ${overlay_dir}/etc/systemd/system/systemd-networkd-wait-online.service.d/override.conf ${chroot_dir}/etc/systemd/system/systemd-networkd-wait-online.service.d/override.conf
 
 # Use gzip compression for the initrd
-cp ${overlay_dir}/etc/initramfs-tools/conf.d/compression.conf ${chroot_dir}/etc/initramfs-tools/conf.d/compression.conf
+mkdir -p ${chroot_dir}/etc/initramfs-tools/conf.d/
+echo "COMPRESS=gzip" > ${chroot_dir}/etc/initramfs-tools/conf.d/compression.conf
 
 # Disable terminal ads
 sed -i 's/ENABLED=1/ENABLED=0/g' ${chroot_dir}/etc/default/motd-news
@@ -198,7 +233,7 @@ sed -i 's/enabled=1/enabled=0/g' ${chroot_dir}/etc/default/apport
 
 # Remove release upgrade motd
 rm -f ${chroot_dir}/var/lib/ubuntu-release-upgrader/release-upgrade-available
-cp ${overlay_dir}/etc/update-manager/release-upgrades ${chroot_dir}/etc/update-manager/release-upgrades
+sed -i 's/Prompt=.*/Prompt=never/g' ${chroot_dir}/etc/update-manager/release-upgrades
 
 # Copy over the ubuntu rockchip install util
 cp ${overlay_dir}/usr/bin/ubuntu-rockchip-install ${chroot_dir}/usr/bin/ubuntu-rockchip-install
@@ -207,12 +242,39 @@ cp ${overlay_dir}/usr/bin/ubuntu-rockchip-install ${chroot_dir}/usr/bin/ubuntu-r
 rm -f ${chroot_dir}/var/lib/dbus/machine-id
 true > ${chroot_dir}/etc/machine-id 
 
+# Configure cloud-init for NoCloud
+cat << EOF > ${chroot_dir}/etc/cloud/cloud.cfg.d/99-fake_cloud.cfg
+datasource_list: [ NoCloud, None ]
+datasource:
+  NoCloud:
+    fs_label: system-boot
+EOF
+
+# Ensure our customized seed location is mounted prior to execution
+mkdir -p ${chroot_dir}/etc/systemd/system/cloud-init-local.service.d
+cat << EOF > ${chroot_dir}/etc/systemd/system/cloud-init-local.service.d/mount-seed.conf
+[Unit]
+RequiresMountsFor=/boot/firmware
+EOF
+
+# Wait for cloud-init to finish (creating users, etc.) before running getty
+mkdir -p ${chroot_dir}/etc/systemd/system/cloud-config.service.d
+cat << EOF > ${chroot_dir}/etc/systemd/system/cloud-config.service.d/getty-wait.conf
+[Unit]
+Before=getty.target
+EOF
+
+if [[ ${RELEASE} == "noble" ]]; then
+    echo "options rfkill master_switch_mode=2" > ${chroot_dir}/etc/modprobe.d/rfkill.conf
+    echo "options rfkill default_state=1" >> ${chroot_dir}/etc/modprobe.d/rfkill.conf
+fi
+
 # Umount temporary API filesystems
 umount -lf ${chroot_dir}/dev/pts 2> /dev/null || true
 umount -lf ${chroot_dir}/* 2> /dev/null || true
 
 # Tar the entire rootfs
-[[ ${DESKTOP_ONLY} != "Y" ]] && cd ${chroot_dir} && XZ_OPT="-3 -T0" tar -cpJf ../ubuntu-22.04.3-preinstalled-server-arm64.rootfs.tar.xz . && cd ..
+[[ ${DESKTOP_ONLY} != "Y" ]] && cd ${chroot_dir} && XZ_OPT="-3 -T0" tar -cpJf ../ubuntu-${RELASE_VERSION}-preinstalled-server-arm64.rootfs.tar.xz . && cd ..
 [[ ${SERVER_ONLY} == "Y" ]] && exit 0
 
 # Mount the temporary API filesystems
@@ -221,6 +283,11 @@ mount -t proc /proc ${chroot_dir}/proc
 mount -t sysfs /sys ${chroot_dir}/sys
 mount -o bind /dev ${chroot_dir}/dev
 mount -o bind /dev/pts ${chroot_dir}/dev/pts
+
+# Remove cloud init stuff from the desktop image
+rm -rf ${chroot_dir}/etc/cloud/cloud.cfg.d/99-fake_cloud.cfg
+rm -rf ${chroot_dir}/etc/systemd/system/cloud-config.service.d/getty-wait.conf
+rm -rf ${chroot_dir}/etc/systemd/system/cloud-init-local.service.d/mount-seed.conf
 
 # Download and update packages
 cat << EOF | chroot ${chroot_dir} /bin/bash
@@ -237,7 +304,7 @@ mesa-utils libcanberra-pulse oem-config-gtk ubiquity-frontend-gtk ubiquity-slide
 language-pack-en-base
 
 # Remove cloud-init and landscape-common
-apt-get -y purge cloud-init landscape-common cryptsetup-initramfs
+apt-get -y purge cloud-init landscape-common cryptsetup-initramfs snapd firefox fwupd
 
 rm -rf /boot/grub/
 
@@ -265,21 +332,25 @@ sed -i 's/127.0.0.1 localhost/127.0.0.1\tlocalhost.localdomain\tlocalhost\n::1\t
 sed -i 's/::1 ip6-localhost ip6-loopback/::1     localhost ip6-localhost ip6-loopback/g' ${chroot_dir}/etc/hosts
 sed -i "/ff00::0 ip6-mcastprefix\b/d" ${chroot_dir}/etc/hosts
 
-# Networking interfaces
-cp ${overlay_dir}/etc/NetworkManager/NetworkManager.conf ${chroot_dir}/etc/NetworkManager/NetworkManager.conf
-cp ${overlay_dir}/usr/lib/NetworkManager/conf.d/10-globally-managed-devices.conf ${chroot_dir}/usr/lib/NetworkManager/conf.d/10-globally-managed-devices.conf
-cp ${overlay_dir}/usr/lib/NetworkManager/conf.d/10-override-wifi-random-mac-disable.conf ${chroot_dir}/usr/lib/NetworkManager/conf.d/10-override-wifi-random-mac-disable.conf
-cp ${overlay_dir}/usr/lib/NetworkManager/conf.d/20-override-wifi-powersave-disable.conf ${chroot_dir}/usr/lib/NetworkManager/conf.d/20-override-wifi-powersave-disable.conf
+if [[ ${RELEASE} == "jammy" ]]; then
+    # Networking interfaces
+    cp ${overlay_dir}/etc/NetworkManager/NetworkManager.conf ${chroot_dir}/etc/NetworkManager/NetworkManager.conf
+    cp ${overlay_dir}/usr/lib/NetworkManager/conf.d/10-globally-managed-devices.conf ${chroot_dir}/usr/lib/NetworkManager/conf.d/10-globally-managed-devices.conf
+    cp ${overlay_dir}/usr/lib/NetworkManager/conf.d/10-override-wifi-random-mac-disable.conf ${chroot_dir}/usr/lib/NetworkManager/conf.d/10-override-wifi-random-mac-disable.conf
+    cp ${overlay_dir}/usr/lib/NetworkManager/conf.d/20-override-wifi-powersave-disable.conf ${chroot_dir}/usr/lib/NetworkManager/conf.d/20-override-wifi-powersave-disable.conf
 
-# Ubuntu desktop uses a diffrent network manager, so remove this systemd override
-rm -rf ${chroot_dir}/etc/systemd/system/systemd-networkd-wait-online.service.d/override.conf
+    # Ubuntu desktop uses a diffrent network manager, so remove this systemd override
+    rm -rf ${chroot_dir}/etc/systemd/system/systemd-networkd-wait-online.service.d/override.conf
+fi
 
 # Enable wayland session
-cp ${overlay_dir}/etc/gdm3/custom.conf ${chroot_dir}/etc/gdm3/custom.conf
+sed -i 's/#WaylandEnable=false/WaylandEnable=true/g' ${chroot_dir}/etc/gdm3/custom.conf
 
 # Have plymouth use the framebuffer
 mkdir -p ${chroot_dir}/etc/initramfs-tools/conf-hooks.d
-cp ${overlay_dir}/etc/initramfs-tools/conf-hooks.d/plymouth ${chroot_dir}/etc/initramfs-tools/conf-hooks.d/plymouth
+echo "if which plymouth >/dev/null 2>&1; then" > ${chroot_dir}/etc/initramfs-tools/conf-hooks.d/plymouth
+echo "    FRAMEBUFFER=y" >> ${chroot_dir}/etc/initramfs-tools/conf-hooks.d/plymouth
+echo "fi" >> ${chroot_dir}/etc/initramfs-tools/conf-hooks.d/plymouth
 
 # Mouse lag/stutter (missed frames) in Wayland sessions
 # https://bugs.launchpad.net/ubuntu/+source/mutter/+bug/1982560
@@ -295,4 +366,4 @@ umount -lf ${chroot_dir}/dev/pts 2> /dev/null || true
 umount -lf ${chroot_dir}/* 2> /dev/null || true
 
 # Tar the entire rootfs
-cd ${chroot_dir} && XZ_OPT="-3 -T0" tar -cpJf ../ubuntu-22.04.3-preinstalled-desktop-arm64.rootfs.tar.xz . && cd ..
+cd ${chroot_dir} && XZ_OPT="-3 -T0" tar -cpJf ../ubuntu-${RELASE_VERSION}-preinstalled-desktop-arm64.rootfs.tar.xz . && cd ..

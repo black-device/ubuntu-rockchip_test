@@ -24,23 +24,33 @@ fi
 # shellcheck source=/dev/null
 source ../config/kernels/"${KERNEL_TARGET}.conf"
 
-if [[ ${LAUNCHPAD} != "Y" ]]; then
-    uboot_package="$(basename "$(find u-boot-"${BOARD}"_*.deb | sort | tail -n1)")"
-    if [ ! -e "$uboot_package" ]; then
-        echo 'Error: could not find the u-boot .deb file'
-        exit 1
-    fi
+if [[ -z ${RELEASE} ]]; then
+    echo "Error: RELEASE is not set"
+    exit 1
+fi
 
-    linux_image_package="$(basename "$(find linux-image-*.deb | sort | tail -n1)")"
-    if [ ! -e "$linux_image_package" ]; then
-        echo 'Error: could not find the linux image .deb file'
-        exit 1
-    fi
+# shellcheck source=/dev/null
+source ../config/releases/"${RELEASE}.sh"
 
-    linux_headers_package="$(basename "$(find linux-headers-*.deb | sort | tail -n1)")"
-    if [ ! -e "$linux_headers_package" ]; then
-        echo 'Error: could not find the linux headers .deb file'
-        exit 1
+if [[ ${RELEASE} != "noble" ]]; then
+    if [[ ${LAUNCHPAD} != "Y" ]]; then
+        uboot_package="$(basename "$(find u-boot-"${BOARD}"_*.deb | sort | tail -n1)")"
+        if [ ! -e "$uboot_package" ]; then
+            echo 'Error: could not find the u-boot .deb file'
+            exit 1
+        fi
+
+        linux_image_package="$(basename "$(find linux-image-*.deb | sort | tail -n1)")"
+        if [ ! -e "$linux_image_package" ]; then
+            echo 'Error: could not find the linux image .deb file'
+            exit 1
+        fi
+
+        linux_headers_package="$(basename "$(find linux-headers-*.deb | sort | tail -n1)")"
+        if [ ! -e "$linux_headers_package" ]; then
+            echo 'Error: could not find the linux headers .deb file'
+            exit 1
+        fi
     fi
 fi
 
@@ -64,29 +74,119 @@ export DEBIAN_FRONTEND=noninteractive
 chroot_dir=rootfs
 overlay_dir=../overlay
 
+setup_mountpoint() {
+    local mountpoint="$1"
+
+    if [ ! -c /dev/mem ]; then
+        mknod -m 660 /dev/mem c 1 1
+        chown root:kmem /dev/mem
+    fi
+
+    mount dev-live -t devtmpfs "$mountpoint/dev"
+    mount devpts-live -t devpts -o nodev,nosuid "$mountpoint/dev/pts"
+    mount proc-live -t proc "$mountpoint/proc"
+    mount sysfs-live -t sysfs "$mountpoint/sys"
+    mount securityfs -t securityfs "$mountpoint/sys/kernel/security"
+    # Provide more up to date apparmor features, matching target kernel
+    # cgroup2 mount for LP: 1944004
+    mount -t cgroup2 none "$mountpoint/sys/fs/cgroup"
+    mount -t tmpfs none "$mountpoint/tmp"
+    mount -t tmpfs none "$mountpoint/var/lib/apt/lists"
+    mount -t tmpfs none "$mountpoint/var/cache/apt"
+    mv "$mountpoint/etc/resolv.conf" resolv.conf.tmp
+    cp /etc/resolv.conf "$mountpoint/etc/resolv.conf"
+    mv "$mountpoint/etc/nsswitch.conf" nsswitch.conf.tmp
+    sed 's/systemd//g' nsswitch.conf.tmp > "$mountpoint/etc/nsswitch.conf"
+    chroot "$mountpoint" apt-get update
+    chroot "$mountpoint" apt-get -y upgrade
+}
+
+teardown_mountpoint() {
+    # Reverse the operations from setup_mountpoint
+    local mountpoint=$(realpath "$1")
+
+    # Clean package cache and update initramfs
+    chroot "$mountpoint" update-initramfs -u
+    chroot "$mountpoint" apt-get -y autoremove
+    chroot "$mountpoint" apt-get -y clean
+    chroot "$mountpoint" apt-get -y autoclean
+
+    # ensure we have exactly one trailing slash, and escape all slashes for awk
+    mountpoint_match=$(echo "$mountpoint" | sed -e's,/$,,; s,/,\\/,g;')'\/'
+    # sort -r ensures that deeper mountpoints are unmounted first
+    for submount in $(awk </proc/self/mounts "\$2 ~ /$mountpoint_match/ \
+                      { print \$2 }" | LC_ALL=C sort -r); do
+        mount --make-private $submount
+        umount $submount
+    done
+    mv resolv.conf.tmp "$mountpoint/etc/resolv.conf"
+    mv nsswitch.conf.tmp "$mountpoint/etc/nsswitch.conf"
+}
+
+if [[ ${RELEASE} == "noble" ]]; then
+    for type in $target; do
+        rm -rf ${chroot_dir} && mkdir -p ${chroot_dir}
+        tar -xpJf "ubuntu-${RELASE_VERSION}-${type}-arm64.rootfs.tar.xz" -C ${chroot_dir}
+
+        setup_mountpoint $chroot_dir
+
+        # Run config hook to handle board specific changes
+        if [[ $(type -t config_image_hook__"${BOARD}") == function ]]; then
+            config_image_hook__"${BOARD}"
+        fi 
+
+        chroot ${chroot_dir} apt-get -y install "u-boot-${BOARD}"
+
+        teardown_mountpoint $chroot_dir
+
+        cd ${chroot_dir} && tar -cpf "../ubuntu-${RELASE_VERSION}-${type}-arm64-${BOARD}.rootfs.tar" . && cd .. && rm -rf ${chroot_dir}
+        ../scripts/build-image.sh "ubuntu-${RELASE_VERSION}-${type}-arm64-${BOARD}.rootfs.tar"
+        rm -f "ubuntu-${RELASE_VERSION}-${type}-arm64-${BOARD}.rootfs.tar"
+    done
+    exit 0
+fi
+
 for type in $target; do
 
     # Clean chroot dir and make sure folder is not mounted
     umount -lf ${chroot_dir}/dev/pts 2> /dev/null || true
     umount -lf ${chroot_dir}/* 2> /dev/null || true
+
     rm -rf ${chroot_dir}
     mkdir -p ${chroot_dir}
 
-    tar -xpJf ubuntu-22.04.3-${type}-arm64.rootfs.tar.xz -C ${chroot_dir}
+    tar -xpJf ubuntu-${RELASE_VERSION}-${type}-arm64.rootfs.tar.xz -C ${chroot_dir}
 
     # Mount the temporary API filesystems
     mkdir -p ${chroot_dir}/{proc,sys,run,dev,dev/pts}
-    mount -t proc /proc ${chroot_dir}/proc
-    mount -t sysfs /sys ${chroot_dir}/sys
-    mount -o bind /dev ${chroot_dir}/dev
-    mount -o bind /dev/pts ${chroot_dir}/dev/pts
+setup_mountpoint $chroot_dir
 
-    if [ "${KERNEL_TARGET}" == "bsp" ]; then
+    chroot ${chroot_dir} /bin/bash -c "apt-get -y update"
+
+    if [ "${KERNEL_TARGET}" == "rockchip-5.10" ] || [ "${KERNEL_TARGET}" == "rockchip-6.1" ]; then
+        if [[ ${RELEASE} != "noble" ]]; then
+        if [[ ${RELEASE} == "jammy" ]]; then
+            cp ${overlay_dir}/etc/apt/preferences.d/rockchip-multimedia-ppa ${chroot_dir}/etc/apt/preferences.d/rockchip-multimedia-ppa
+            chroot ${chroot_dir} /bin/bash -c "add-apt-repository -y ppa:liujianfeng1994/rockchip-multimedia"
+
+            if [ "${OVERLAY_PREFIX}" == "rk3588" ]; then
+                cp ${overlay_dir}/etc/apt/preferences.d/panfork-mesa-ppa ${chroot_dir}/etc/apt/preferences.d/panfork-mesa-ppa
+                chroot ${chroot_dir} /bin/bash -c "add-apt-repository -y ppa:liujianfeng1994/panfork-mesa"
+            fi
+        else
+            cp ${overlay_dir}/etc/apt/preferences.d/jjriek-rockchip-multimedia-ppa ${chroot_dir}/etc/apt/preferences.d/jjriek-rockchip-multimedia-ppa
+            chroot ${chroot_dir} /bin/bash -c "add-apt-repository -y ppa:jjriek/rockchip-multimedia"  
+
+            if [ "${OVERLAY_PREFIX}" == "rk3588" ]; then
+                cp ${overlay_dir}/etc/apt/preferences.d/jjriek-panfork-mesa-ppa ${chroot_dir}/etc/apt/preferences.d/jjriek-panfork-mesa-ppa
+                chroot ${chroot_dir} /bin/bash -c "add-apt-repository -y ppa:jjriek/panfork-mesa" 
+            fi
+        fi
+
+        # Download and update installed packages
+        chroot ${chroot_dir} /bin/bash -c "apt-get -y update && apt-get --allow-downgrades -y upgrade && apt-get --allow-downgrades -y dist-upgrade"
+
         if [ "${OVERLAY_PREFIX}" == "rk3588" ]; then
-            # Pin and add panfork mesa ppa
-            cp ${overlay_dir}/etc/apt/preferences.d/panfork-mesa-ppa ${chroot_dir}/etc/apt/preferences.d/panfork-mesa-ppa
-            chroot ${chroot_dir} /bin/bash -c "add-apt-repository -y ppa:liujianfeng1994/panfork-mesa"
-
             # Set cpu governor to performance
             cp ${overlay_dir}/usr/lib/systemd/system/cpu-governor-performance.service ${chroot_dir}/usr/lib/systemd/system/cpu-governor-performance.service
             chroot ${chroot_dir} /bin/bash -c "systemctl enable cpu-governor-performance"
@@ -94,14 +194,13 @@ for type in $target; do
             # Set gpu governor to performance
             cp ${overlay_dir}/usr/lib/systemd/system/gpu-governor-performance.service ${chroot_dir}/usr/lib/systemd/system/gpu-governor-performance.service
             chroot ${chroot_dir} /bin/bash -c "systemctl enable gpu-governor-performance"
+
+            # Install the mali g610 firmware
+            chroot ${chroot_dir} /bin/bash -c "apt-get -y install mali-g610-firmware"
         fi
 
-        # Pin and add rockchip multimedia ppa
-        cp ${overlay_dir}/etc/apt/preferences.d/rockchip-multimedia-ppa ${chroot_dir}/etc/apt/preferences.d/rockchip-multimedia-ppa
-        chroot ${chroot_dir} /bin/bash -c "add-apt-repository -y ppa:liujianfeng1994/rockchip-multimedia"
-
-        # Download and update installed packages
-        chroot ${chroot_dir} /bin/bash -c "apt-get -y update && apt-get -y upgrade && apt-get -y dist-upgrade"
+        # Install the multimedia config
+        chroot ${chroot_dir} /bin/bash -c "apt-get -y install rockchip-multimedia-config"
 
         # Realtek 8811CU/8821CU usb modeswitch support
         cp ${chroot_dir}/lib/udev/rules.d/40-usb_modeswitch.rules ${chroot_dir}/etc/udev/rules.d/40-usb_modeswitch.rules
@@ -127,25 +226,10 @@ for type in $target; do
                 mkdir -p ${chroot_dir}/usr/lib/scripts
                 cp ${overlay_dir}/usr/lib/scripts/gdm-hack.sh ${chroot_dir}/usr/lib/scripts/gdm-hack.sh
                 cp ${overlay_dir}/etc/udev/rules.d/99-gdm-hack.rules ${chroot_dir}/etc/udev/rules.d/99-gdm-hack.rules
-
-                chroot ${chroot_dir} /bin/bash -c "apt-get -y install libwidevinecdm librockchip-mpp1 librockchip-mpp-dev librockchip-vpu0 libv4l-rkmpp librist-dev librist4 librga2 librga-dev rist-tools rockchip-mpp-demos rockchip-multimedia-config gstreamer1.0-rockchip1 chromium-browser mali-g610-firmware malirun"
-            else
-                chroot ${chroot_dir} /bin/bash -c "apt-get -y install libwidevinecdm rockchip-multimedia-config chromium-browser"
             fi
 
-            # Chromium uses fixed paths for libv4l2.so
-            chroot ${chroot_dir} /bin/bash -c "ln -rsf /usr/lib/*/libv4l2.so /usr/lib/"
-            chroot ${chroot_dir} /bin/bash -c "[ -e /usr/lib/aarch64-linux-gnu/ ] && ln -Tsf lib /usr/lib64"
-
-            # Config file for mpv
-            cp ${overlay_dir}/etc/mpv/mpv.conf ${chroot_dir}/etc/mpv/mpv.conf
-
-            # Use mpv as the default video player
-            sed -i 's/org\.gnome\.Totem\.desktop/mpv\.desktop/g' ${chroot_dir}/usr/share/applications/gnome-mimeapps.list 
-
-            # Config file for xorg
-            mkdir -p ${chroot_dir}/etc/X11/xorg.conf.d
-            cp ${overlay_dir}/etc/X11/xorg.conf.d/20-modesetting.conf ${chroot_dir}/etc/X11/xorg.conf.d/20-modesetting.conf
+            # Install chrome and gstreamer rockchip
+            chroot ${chroot_dir} /bin/bash -c "apt-get -y install gstreamer1.0-rockchip1 chromium-browser libv4l-rkmpp"
 
             # Set chromium inital prefrences
             mkdir -p ${chroot_dir}/usr/lib/chromium-browser
@@ -153,18 +237,34 @@ for type in $target; do
 
             # Set chromium default launch args
             mkdir -p ${chroot_dir}/usr/lib/chromium-browser
+            mkdir -p ${chroot_dir}/etc/chromium-browser
             cp ${overlay_dir}/etc/chromium-browser/default ${chroot_dir}/etc/chromium-browser/default
-
-            # Set chromium as default browser
-            chroot ${chroot_dir} /bin/bash -c "update-alternatives --install /usr/bin/x-www-browser x-www-browser /usr/bin/chromium-browser 500"
-            chroot ${chroot_dir} /bin/bash -c "update-alternatives --set x-www-browser /usr/bin/chromium-browser"
-            sed -i 's/firefox-esr\.desktop/chromium-browser\.desktop/g;s/firefox\.desktop;//g' ${chroot_dir}/usr/share/applications/gnome-mimeapps.list 
 
             # Add chromium to favorites bar
             mkdir -p ${chroot_dir}/etc/dconf/db/local.d
             cp ${overlay_dir}/etc/dconf/db/local.d/00-favorite-apps ${chroot_dir}/etc/dconf/db/local.d/00-favorite-apps
             cp ${overlay_dir}/etc/dconf/profile/user ${chroot_dir}/etc/dconf/profile/user
             chroot ${chroot_dir} /bin/bash -c "dconf update"
+
+            if [[ ${RELEASE} == "jammy" ]]; then
+                chroot ${chroot_dir} /bin/bash -c "apt-get -y install libwidevinecdm"
+
+                # Config file for mpv
+                cp ${overlay_dir}/etc/mpv/mpv.conf ${chroot_dir}/etc/mpv/mpv.conf
+
+                # Set chromium as default browser
+                chroot ${chroot_dir} /bin/bash -c "update-alternatives --install /usr/bin/x-www-browser x-www-browser /usr/bin/chromium-browser 500"
+                chroot ${chroot_dir} /bin/bash -c "update-alternatives --set x-www-browser /usr/bin/chromium-browser"
+
+                # Use mpv as the default video player
+                sed -i 's/org\.gnome\.Totem\.desktop/mpv\.desktop/g' ${chroot_dir}/usr/share/applications/gnome-mimeapps.list 
+
+                # Set chromium as default browser
+                sed -i 's/firefox-esr\.desktop/chromium-browser\.desktop/g;s/firefox\.desktop;//g' ${chroot_dir}/usr/share/applications/gnome-mimeapps.list 
+            else
+                cp ${overlay_dir}/usr/share/applications/mimeapps.list ${chroot_dir}/usr/share/applications/mimeapps.list
+            fi
+        fi
         fi
     fi
 
@@ -184,8 +284,10 @@ for type in $target; do
 
     # Install the kernel
     if [[ ${LAUNCHPAD}  == "Y" ]]; then
-        chroot ${chroot_dir} /bin/bash -c "apt-get -y install linux-rockchip-5.10"
-        chroot ${chroot_dir} /bin/bash -c "depmod -a 5.10.160-rockchip"
+        if [[ ${RELEASE} == "jammy" ]]; then
+            chroot ${chroot_dir} /bin/bash -c "apt-get -y install linux-rockchip-5.10"
+            chroot ${chroot_dir} /bin/bash -c "depmod -a 5.10.160-rockchip"
+        fi
     else
         cp "${linux_image_package}" "${linux_headers_package}" ${chroot_dir}/tmp/
         chroot ${chroot_dir} /bin/bash -c "dpkg -i /tmp/{${linux_image_package},${linux_headers_package}} && rm -rf /tmp/*"
@@ -193,21 +295,19 @@ for type in $target; do
         chroot ${chroot_dir} /bin/bash -c "apt-mark hold $(echo "${linux_image_package}" | sed -rn 's/(.*)_[[:digit:]].*/\1/p')"
         chroot ${chroot_dir} /bin/bash -c "apt-mark hold $(echo "${linux_headers_package}" | sed -rn 's/(.*)_[[:digit:]].*/\1/p')"
     fi
+    chroot ${chroot_dir} /bin/bash -c "apt-get -y purge flash-kernel"
+    chroot ${chroot_dir} /bin/bash -c "apt-get -y install u-boot-menu"
+    chroot ${chroot_dir} /bin/bash -c "update-initramfs -u"
 
     # Clean package cache
     chroot ${chroot_dir} /bin/bash -c "apt-get -y autoremove && apt-get -y clean && apt-get -y autoclean"
-
-    # Populate the boot firmware path
-	umount -lf ${chroot_dir}/sys
-	mkdir -p ${chroot_dir}/boot/firmware
-    chroot ${chroot_dir} /bin/bash -c "FK_FORCE=yes flash-kernel"
-
+teardown_mountpoint $chroot_dir
     # Umount temporary API filesystems
     umount -lf ${chroot_dir}/dev/pts 2> /dev/null || true
     umount -lf ${chroot_dir}/* 2> /dev/null || true
 
     # Tar the entire rootfs
-    cd ${chroot_dir} && tar -cpf ../ubuntu-22.04.3-${type}-arm64-"${BOARD}".rootfs.tar . && cd .. && rm -rf ${chroot_dir}
-    ../scripts/build-image.sh ubuntu-22.04.3-${type}-arm64-"${BOARD}".rootfs.tar
-    rm -f ubuntu-22.04.3-${type}-arm64-"${BOARD}".rootfs.tar
+    cd ${chroot_dir} && tar -cpf ../ubuntu-${RELASE_VERSION}-${type}-arm64-"${BOARD}".rootfs.tar . && cd .. && rm -rf ${chroot_dir}
+    ../scripts/build-image.sh ubuntu-${RELASE_VERSION}-${type}-arm64-"${BOARD}".rootfs.tar
+    rm -f ubuntu-${RELASE_VERSION}-${type}-arm64-"${BOARD}".rootfs.tar
 done
